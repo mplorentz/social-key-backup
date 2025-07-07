@@ -1,6 +1,6 @@
 # Social Secret Backup
 
-**This is alpha software, please do not use it for real secrets yet.**
+_This is alpha software, please do not use it for real secrets yet._
 
 This is a tool for backing up Nostr keys to a set of peers. It uses the Shamir's Secret Key Sharing algorithm to break the key into shares so that no peer has your entire key, but if enough peers cooperate they can put their shares together to reassemble the key. This is more secure and less fragile than storing a single copy of the entire key in one location. 
 

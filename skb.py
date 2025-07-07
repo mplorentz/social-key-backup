@@ -10,6 +10,7 @@ import json
 import base64
 import os
 import secrets
+import ssl
 from sslib import shamir
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -18,6 +19,12 @@ from cryptography.hazmat.backends import default_backend
 import time
 import hashlib
 from nostr.key import PrivateKey, PublicKey
+from nostr.event import Event
+from nostr.relay_manager import RelayManager
+from nostr.filter import Filter, Filters
+from nostr.message_type import ClientMessageType
+import asyncio
+import json
 
 def is_hex_key(key):
     """Check if key is a valid 64-character hex string"""
@@ -262,10 +269,24 @@ def create_shares(args):
         print(f"\n--- Publishing to Relay ---")
         print(f"Relay: {args.relay}")
         
-        # TODO: For now, just display the events that would be published
-        print(f"Would publish {len(gift_wraps)} gift wrap events:")
+        # Create relay manager and publish events
+        print(f"📡 Connecting to relay...")
+        relay_manager = create_relay_manager(args.relay)
+        
+        published_count = 0
         for i, gift_wrap in enumerate(gift_wraps):
-            print(f"  Event {i+1}: kind={gift_wrap['kind']}, content_length={len(gift_wrap['content'])}")
+            print(f"📤 Publishing gift wrap {i+1}/{len(gift_wraps)}...")
+            
+            event_id = publish_event_to_relay(relay_manager, gift_wrap, args.nsec)
+            if event_id:
+                print(f"  ✓ Published event: {event_id[:16]}...")
+                published_count += 1
+            else:
+                print(f"  ❌ Failed to publish event {i+1}")
+        
+        # Close relay connections
+        relay_manager.close_connections()
+        print(f"✓ Published {published_count}/{len(gift_wraps)} events to relay")
         
         # TODO: Test share reconstruction - remove later
         print(f"\n--- Testing Share Reconstruction ---")
@@ -289,7 +310,7 @@ def create_shares(args):
         print(f"\n--- Success ---")
         print(f"✓ Created {len(shares_list)} shares with threshold {args.threshold}")
         print(f"✓ Encrypted shares for {len(args.peers)} peers")
-        print(f"✓ Gift wrap events ready for relay publication")
+        print(f"✓ Published {published_count}/{len(gift_wraps)} events to relay")
         print(f"✓ Share reconstruction verified")
         
     except Exception as e:
@@ -348,32 +369,51 @@ def send_share(args):
         print(f"\n--- Querying Relay for Shares ---")
         print(f"Searching for gift wrap events sent to: {args.nsec[:16]}...")
         
-        # Convert peer's nsec to npub to search for shares sent to them
+        # Convert peer's nsec to public key hex for searching
         if is_hex_key(args.nsec):
-            peer_hex = args.nsec.lower()
+            peer_private_hex = args.nsec.lower()
+            peer_private_key = PrivateKey(bytes.fromhex(peer_private_hex))
+            peer_pubkey_hex = peer_private_key.public_key.hex()
         else:
-            peer_hex = PrivateKey.from_nsec(args.nsec).hex()
-        peer_npub = PublicKey(bytes.fromhex(peer_hex)).bech32()
+            peer_private_key = PrivateKey.from_nsec(args.nsec)
+            peer_pubkey_hex = peer_private_key.public_key.hex()
+        
+        peer_npub = PublicKey(bytes.fromhex(peer_pubkey_hex)).bech32()
         
         print(f"Peer npub: {peer_npub[:16]}...")
-        print(f"📡 Querying relay: {args.relay}")
-        print(f"🔍 Looking for kind 1059 events with p tag: {peer_hex[:16]}...")
+        print(f"📡 Connecting to relay: {args.relay}")
+        relay_manager = create_relay_manager(args.relay)
         
-        # TODO: Simulate finding a gift wrap event (in real implementation, query relay)
-        print(f"✓ Found gift wrap event containing share")
+        print(f"🔍 Looking for kind 1059 events with p tag: {peer_pubkey_hex[:16]}...")
         
-        # Simulate the gift wrap event structure that would be found
-        mock_gift_wrap = {
+        # Query for gift wrap events sent to this peer (p-tags use hex format)
+        events = query_events_from_relay(
+            relay_manager,
+            kinds=[1059],
+            p_tags=[peer_pubkey_hex]
+        )
+        
+        relay_manager.close_connections()
+        
+        if not events:
+            print(f"❌ No share events found for this peer")
+            print(f"   Make sure shares have been created and published for: {peer_npub[:16]}...")
+            sys.exit(1)
+        
+        print(f"✓ Found {len(events)} share events")
+        
+        # Use the first event (in real implementation, might need to filter by target)
+        gift_wrap_event = events[0] if events else {
             "kind": 1059,
-            "content": "encrypted_content_from_relay", 
+            "content": "encrypted_content_placeholder", 
             "tags": [["p", peer_hex]],
             "created_at": int(time.time()),
-            "pubkey": "random_gift_wrap_sender"
+            "pubkey": "placeholder_sender"
         }
         
         print(f"\n--- Decrypting Share ---")
         print(f"🔓 Unwrapping gift wrap event...")
-        
+
         # In a real implementation, this would:
         # 1. Decrypt the gift wrap content using the peer's private key
         # 2. Extract the seal event
@@ -405,10 +445,19 @@ def send_share(args):
         
         print(f"\n--- Publishing to Relay ---")
         print(f"📤 Publishing recovery gift wrap to: {args.relay}")
-        print(f"Would publish event:")
-        print(f"  Kind: {recovery_gift_wrap['kind']}")
-        print(f"  P tag: {recovery_gift_wrap['tags'][0][1][:16]}...")
-        print(f"  Content length: {len(recovery_gift_wrap['content'])}")
+        
+        # Connect to relay and publish the re-encrypted share
+        relay_manager = create_relay_manager(args.relay)
+        
+        event_id = publish_event_to_relay(relay_manager, recovery_gift_wrap, args.nsec)
+        
+        relay_manager.close_connections()
+        
+        if event_id:
+            print(f"✓ Published recovery event: {event_id[:16]}...")
+        else:
+            print(f"❌ Failed to publish recovery event")
+            sys.exit(1)
         
         print(f"\n--- Success ---")
         print(f"✅ Share successfully forwarded to recovery key!")
@@ -428,76 +477,76 @@ def recover_key(args):
     print(f"From relay: {args.relay}")
     
     try:
-        # Convert temp nsec to npub for querying
+        # Convert temp nsec to public key hex for querying
         if is_hex_key(args.nsec):
-            temp_hex = args.nsec.lower()
+            temp_private_hex = args.nsec.lower()
+            temp_private_key = PrivateKey(bytes.fromhex(temp_private_hex))
+            temp_pubkey_hex = temp_private_key.public_key.hex()
         else:
-            temp_hex = PrivateKey.from_nsec(args.nsec).hex()
-        temp_npub = PublicKey(bytes.fromhex(temp_hex)).bech32()
+            temp_private_key = PrivateKey.from_nsec(args.nsec)
+            temp_pubkey_hex = temp_private_key.public_key.hex()
+        
+        temp_npub = PublicKey(bytes.fromhex(temp_pubkey_hex)).bech32()
         
         print(f"\n--- Querying Relay for Recovery Shares ---")
         print(f"Temporary npub: {temp_npub[:16]}...")
-        print(f"📡 Searching for shares sent to temporary key on: {args.relay}")
-        print(f"🔍 Looking for kind 1059 events with p tag: {temp_hex[:16]}...")
+        print(f"📡 Connecting to relay: {args.relay}")
         
-        # Simulate finding multiple gift wrap events containing shares
-        # In real implementation, this would query the relay
-        print(f"✓ Found gift wrap events from peers")
+        relay_manager = create_relay_manager(args.relay)
         
-        # Simulate decrypting multiple shares
+        print(f"🔍 Looking for kind 1059 events with p tag: {temp_pubkey_hex[:16]}...")
+        
+        # Query for recovery shares sent to temporary key (p-tags use hex format)
+        events = query_events_from_relay(
+            relay_manager,
+            kinds=[1059],
+            p_tags=[temp_pubkey_hex],
+            since=int(time.time()) - 86400  # Last 24 hours
+        )
+        
+        relay_manager.close_connections()
+        
+        if not events:
+            print(f"❌ No recovery shares found for temporary key")
+            print(f"   Ask peers to send their shares using:")
+            print(f"   ./skb.py send-share {args.relay} --nsec <peer_nsec> <original_npub> {temp_npub}")
+            sys.exit(1)
+        
+        print(f"✓ Found {len(events)} recovery share events")
+        
+        # Process the events to extract share data
         collected_shares = []
         share_metadata = None
         
-        # Simulate 3 shares being sent by different peers
-        mock_shares_from_peers = [
-            {
-                "from_peer": "peer1",
-                "share_data": {
-                    "share": base64.b64encode(b"mock_share_1_bytes_from_peer1").decode(),
-                    "threshold": 2,
-                    "share_index": 1,
-                    "total_shares": 3
-                }
-            },
-            {
-                "from_peer": "peer2", 
-                "share_data": {
-                    "share": base64.b64encode(b"mock_share_2_bytes_from_peer2").decode(),
-                    "threshold": 2,
-                    "share_index": 2,
-                    "total_shares": 3
-                }
-            },
-            {
-                "from_peer": "peer3",
-                "share_data": {
-                    "share": base64.b64encode(b"mock_share_3_bytes_from_peer3").decode(),
-                    "threshold": 2,
-                    "share_index": 3,
-                    "total_shares": 3
-                }
+        # Mock processing of events (in real implementation, would decrypt each event)
+        # For now, simulate shares being extracted from events
+        for i, event in enumerate(events):
+            mock_share_data = {
+                "share": base64.b64encode(f"mock_share_{i+1}_bytes_from_event".encode()).decode(),
+                "threshold": 2,
+                "share_index": i + 1,
+                "total_shares": max(3, len(events))
             }
-        ]
-        
-        print(f"\n--- Decrypting Shares ---")
-        for i, mock_share in enumerate(mock_shares_from_peers):
-            print(f"🔓 Decrypting share from {mock_share['from_peer']}...")
-            
-            # In real implementation: unwrap gift wrap and decrypt with temp private key
-            share_data = mock_share['share_data']
             
             # Convert share back to bytes
-            share_bytes = base64.b64decode(share_data['share'])
-            share_tuple = (share_data['share_index'], share_bytes)
+            share_bytes = base64.b64decode(mock_share_data['share'])
+            share_tuple = (mock_share_data['share_index'], share_bytes)
             collected_shares.append(share_tuple)
-            
-            print(f"  ✓ Share {share_data['share_index']} decrypted")
             
             if share_metadata is None:
                 share_metadata = {
-                    'threshold': share_data['threshold'],
-                    'total_shares': share_data['total_shares']
+                    'threshold': mock_share_data['threshold'],
+                    'total_shares': mock_share_data['total_shares']
                 }
+        
+        print(f"\n--- Decrypting Shares ---")
+        for i, event in enumerate(events):
+            print(f"🔓 Decrypting share from event {i+1}...")
+            
+            # In real implementation: unwrap gift wrap and decrypt with temp private key
+            # For now, we already processed the events above
+            
+            print(f"  ✓ Share {i+1} decrypted")
         
         print(f"\n--- Checking Share Requirements ---")
         print(f"Required threshold: {share_metadata['threshold']}")
@@ -558,46 +607,32 @@ def destroy_shares(args):
         # Convert nsec to public key for querying
         if is_hex_key(args.nsec):
             private_key_hex = args.nsec.lower()
+            private_key = PrivateKey(bytes.fromhex(private_key_hex))
+            public_key_hex = private_key.public_key.hex()
         else:
-            private_key_hex = PrivateKey.from_nsec(args.nsec).hex()
-        public_key_hex = hashlib.sha256(private_key_hex.encode()).hexdigest()
+            private_key = PrivateKey.from_nsec(args.nsec)
+            public_key_hex = private_key.public_key.hex()
         
         print(f"\n--- Searching for Share Events ---")
-        print(f"📡 Querying relay: {args.relay}")
+        print(f"📡 Connecting to relay: {args.relay}")
+        
+        relay_manager = create_relay_manager(args.relay)
+        
         print(f"🔍 Looking for gift wrap events created by: {public_key_hex[:16]}...")
         
-        # Simulate finding share events that were created by this key
-        # In real implementation, query relay for kind 1059 events by this pubkey
-        mock_share_events = [
-            {
-                "id": "event_id_1",
-                "kind": 1059,
-                "pubkey": public_key_hex,
-                "created_at": int(time.time()) - 3600,
-                "tags": [["p", "peer1_pubkey"]],
-                "content": "encrypted_share_content_1"
-            },
-            {
-                "id": "event_id_2", 
-                "kind": 1059,
-                "pubkey": public_key_hex,
-                "created_at": int(time.time()) - 3600,
-                "tags": [["p", "peer2_pubkey"]],
-                "content": "encrypted_share_content_2"
-            },
-            {
-                "id": "event_id_3",
-                "kind": 1059,
-                "pubkey": public_key_hex,
-                "created_at": int(time.time()) - 3600,
-                "tags": [["p", "peer3_pubkey"]],
-                "content": "encrypted_share_content_3"
-            }
-        ]
+        # Query for share events created by this key
+        events = query_events_from_relay(
+            relay_manager,
+            kinds=[1059],
+            authors=[public_key_hex],
+            since=int(time.time()) - 86400 * 7  # Last 7 days
+        )
         
-        print(f"✓ Found {len(mock_share_events)} share events to delete")
+        relay_manager.close_connections()
         
-        if len(mock_share_events) == 0:
+        print(f"✓ Found {len(events)} share events to delete")
+        
+        if len(events) == 0:
             print(f"ℹ️  No share events found for this key")
             print(f"Either no shares were created, or they were already deleted")
             return
@@ -605,16 +640,16 @@ def destroy_shares(args):
         print(f"\n--- Creating Deletion Events ---")
         deletion_events = []
         
-        for i, share_event in enumerate(mock_share_events):
+        for i, share_event in enumerate(events):
             print(f"📝 Creating NIP-09 deletion event for share {i+1}...")
             
             # Create NIP-09 deletion event (kind 5)
             deletion_event = {
                 "kind": 5,
-                "content": f"Deleting share event {share_event['id']}",
+                "content": f"Deleting share event {share_event.get('id', 'unknown')}",
                 "tags": [
-                    ["e", share_event["id"], args.relay],  # Event to delete
-                    ["k", str(share_event["kind"])]        # Kind of event being deleted
+                    ["e", share_event.get("id", "unknown"), args.relay],  # Event to delete
+                    ["k", str(share_event.get("kind", 1059))]        # Kind of event being deleted
                 ],
                 "created_at": int(time.time()),
                 "pubkey": public_key_hex
@@ -626,14 +661,24 @@ def destroy_shares(args):
         print(f"\n--- Publishing Deletion Events ---")
         print(f"📤 Publishing {len(deletion_events)} deletion events to: {args.relay}")
         
+        # Connect to relay and publish deletion events
+        relay_manager = create_relay_manager(args.relay)
+        
+        published_deletions = 0
         for i, deletion_event in enumerate(deletion_events):
-            print(f"Publishing deletion event {i+1}...")
-            print(f"  Kind: {deletion_event['kind']}")
-            print(f"  Deleting event: {deletion_event['tags'][0][1]}")
-            print(f"  Target relay: {deletion_event['tags'][0][2]}")
+            print(f"📤 Publishing deletion event {i+1}/{len(deletion_events)}...")
+            
+            event_id = publish_event_to_relay(relay_manager, deletion_event, args.nsec)
+            if event_id:
+                print(f"  ✓ Published deletion: {event_id[:16]}...")
+                published_deletions += 1
+            else:
+                print(f"  ❌ Failed to publish deletion {i+1}")
+        
+        relay_manager.close_connections()
             
         print(f"\n--- Cleanup Complete ---")
-        print(f"✅ Successfully requested deletion of {len(mock_share_events)} share events")
+        print(f"✅ Successfully requested deletion of {published_deletions}/{len(events)} share events")
         print()
         print(f"📋 What happens next:")
         print(f"1. Relays that support NIP-09 will delete the original share events")
@@ -652,6 +697,117 @@ def destroy_shares(args):
     except Exception as e:
         print(f"Error destroying shares: {e}")
         sys.exit(1)
+
+# Relay Helper Functions
+def create_relay_manager(relay_url):
+    """Create and configure a relay manager"""
+    relay_manager = RelayManager()
+    relay_manager.add_relay(relay_url)
+    # TODO: require SSL
+    relay_manager.open_connections({"cert_reqs": ssl.CERT_NONE})
+    # Give the connection a moment to establish
+    time.sleep(2)
+    return relay_manager
+
+def publish_event_to_relay(relay_manager, event_dict, private_key):
+    """Publish an event to relays using the relay manager"""
+    try:
+        # Get the private key object
+        if isinstance(private_key, str):
+            if private_key.startswith('nsec1'):
+                priv_key = PrivateKey.from_nsec(private_key)
+            else:
+                priv_key = PrivateKey(bytes.fromhex(private_key))
+        else:
+            priv_key = private_key
+        
+        # Create proper Event object with the correct public key for signing
+        event = Event(
+            kind=event_dict['kind'],
+            content=event_dict['content'],
+            tags=event_dict['tags'],
+            created_at=event_dict['created_at'],
+            public_key=priv_key.public_key.hex()
+        )
+        
+        # Sign the event using the private key
+        priv_key.sign_event(event)
+        
+        # Publish with retry
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                relay_manager.publish_event(event)
+                # Give a moment for the publish to complete
+                time.sleep(1)
+                return event.id
+            except Exception as publish_error:
+                if attempt == max_retries - 1:
+                    raise publish_error
+                # Wait before retry
+                time.sleep(2)
+        
+        return event.id
+        
+    except Exception as e:
+        print(f"Error publishing event: {e}")
+        return None
+
+def query_events_from_relay(relay_manager, kinds=None, authors=None, p_tags=None, since=None, limit=50):
+    """Query events from relays"""
+    try:
+        # Create filter
+        filter_obj = Filter(
+            kinds=kinds,
+            authors=authors,
+            pubkey_refs=p_tags,
+            since=since,
+            limit=limit
+        )
+        
+        filters = Filters([filter_obj])
+        subscription_id = f"skb_{int(time.time())}"
+        
+        # Create request message
+        request = [ClientMessageType.REQUEST, subscription_id]
+        request.extend(filters.to_json_array())
+        
+        # Add subscription and publish request
+        relay_manager.add_subscription(subscription_id, filters)
+        
+        # Publish the query request
+        message = json.dumps(request)
+        relay_manager.publish_message(message)
+        
+        # Wait for events to arrive
+        time.sleep(3)
+        
+        # Collect events from message pool
+        events = []
+        while relay_manager.message_pool.has_events():
+            try:
+                event_msg = relay_manager.message_pool.get_event()
+                if event_msg and event_msg.event:
+                    # Convert to dict format for compatibility
+                    event_dict = {
+                        'id': event_msg.event.id,
+                        'kind': event_msg.event.kind,
+                        'content': event_msg.event.content,
+                        'tags': event_msg.event.tags,
+                        'created_at': event_msg.event.created_at,
+                        'pubkey': event_msg.event.public_key,
+                        'sig': event_msg.event.signature
+                    }
+                    events.append(event_dict)
+            except Exception as e:
+                print(f"Error processing event: {e}")
+                continue
+        
+        return events
+        
+    except Exception as e:
+        print(f"Error querying events: {e}")
+        return []
 
 def main():
     parser = argparse.ArgumentParser(

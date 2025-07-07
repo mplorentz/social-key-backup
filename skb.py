@@ -12,10 +12,6 @@ import os
 import secrets
 import ssl
 from sslib import shamir
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
 import time
 import hashlib
 from nostr.key import PrivateKey, PublicKey
@@ -25,6 +21,8 @@ from nostr.filter import Filter, Filters
 from nostr.message_type import ClientMessageType
 import asyncio
 import json
+
+# TODO: what do about duplicate shares on relay?
 
 def is_hex_key(key):
     """Check if key is a valid 64-character hex string"""
@@ -59,7 +57,7 @@ def validate_key_format(key, expected_prefix=None):
 
 # Crypto Functions (Basic NIP-44 & NIP-59 implementation)
 def nip44_encrypt(plaintext, sender_privkey, receiver_pubkey):
-    """NIP-44-style encryption using proper ECDH with nostr library"""
+    """NIP-44-style encryption using nostr library's built-in methods"""
     try:
         # Convert keys to proper nostr objects
         if is_hex_key(sender_privkey):
@@ -74,47 +72,17 @@ def nip44_encrypt(plaintext, sender_privkey, receiver_pubkey):
         
         # Ensure plaintext is string
         if isinstance(plaintext, bytes):
-            plaintext = plaintext.decode()
+            plaintext = plaintext.decode('utf-8')
         
-        # Create proper ECDH shared secret using nostr library  
-        shared_secret = sender_key.compute_shared_secret(receiver_key.hex())
-        
-        # Derive encryption key using HKDF
-        derived_key = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=b'nip44-encrypt',
-            backend=default_backend()
-        ).derive(shared_secret)
-        
-        # Generate random nonce
-        nonce = os.urandom(12)
-        
-        # Encrypt using AES-GCM
-        cipher = Cipher(algorithms.AES(derived_key), modes.GCM(nonce), backend=default_backend())
-        encryptor = cipher.encryptor()
-        ciphertext = encryptor.update(plaintext.encode()) + encryptor.finalize()
-        
-        # Return base64 encoded result
-        encrypted_data = nonce + encryptor.tag + ciphertext
-        return base64.b64encode(encrypted_data).decode()
+        # Use nostr library's built-in encryption
+        return sender_key.encrypt_message(plaintext, receiver_key.hex())
         
     except Exception as e:
-        print(f"Error in NIP-44 encryption: {e}")
-        sys.exit(1)
+        raise ValueError(f"Error in NIP-44 encryption: {e}")
 
 def nip44_decrypt(ciphertext, receiver_privkey, sender_pubkey):
-    """NIP-44-style decryption using proper ECDH with nostr library"""
+    """NIP-44-style decryption using nostr library's built-in methods"""
     try:
-        # Decode from base64
-        encrypted_data = base64.b64decode(ciphertext)
-        
-        # Extract components
-        nonce = encrypted_data[:12]
-        tag = encrypted_data[12:28]
-        ciphertext_bytes = encrypted_data[28:]
-        
         # Convert keys to proper nostr objects
         if is_hex_key(receiver_privkey):
             receiver_key = PrivateKey(bytes.fromhex(receiver_privkey))
@@ -126,75 +94,90 @@ def nip44_decrypt(ciphertext, receiver_privkey, sender_pubkey):
         else:
             sender_key = PublicKey.from_npub(sender_pubkey)
         
-        # Create proper ECDH shared secret using nostr library
-        shared_secret = receiver_key.compute_shared_secret(sender_key.hex())
-        
-        # Derive decryption key
-        derived_key = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=b'nip44-encrypt',
-            backend=default_backend()
-        ).derive(shared_secret)
-        
-        # Decrypt using AES-GCM
-        cipher = Cipher(algorithms.AES(derived_key), modes.GCM(nonce, tag), backend=default_backend())
-        decryptor = cipher.decryptor()
-        plaintext = decryptor.update(ciphertext_bytes) + decryptor.finalize()
-        
-        return plaintext.decode()
+        # Use nostr library's built-in decryption
+        return receiver_key.decrypt_message(ciphertext, sender_key.hex())
         
     except Exception as e:
-        print(f"Error in NIP-44 decryption: {e}")
-        sys.exit(1)
+        raise ValueError(f"Error in NIP-44 decryption: {e}")
 
 def create_gift_wrap(share_data, sender_privkey, receiver_pubkey):
     """Create NIP-59 gift wrap containing encrypted share"""
     try:
         # Convert keys to proper format
         if is_hex_key(sender_privkey):
-            sender_hex = sender_privkey.lower()
+            sender_key = PrivateKey(bytes.fromhex(sender_privkey))
         else:
-            sender_hex = PrivateKey.from_nsec(sender_privkey).hex()
+            sender_key = PrivateKey.from_nsec(sender_privkey)
             
         if is_hex_key(receiver_pubkey):
-            receiver_hex = receiver_pubkey.lower()
+            receiver_key = PublicKey(bytes.fromhex(receiver_pubkey))
         else:
-            receiver_hex = PublicKey.from_npub(receiver_pubkey).hex()
+            receiver_key = PublicKey.from_npub(receiver_pubkey)
         
         # Step 1: Create rumor (unsigned event with share data)
         rumor_content = json.dumps({
             "share": share_data["share"],
             "threshold": share_data["threshold"],
+            "share_index": share_data.get("share_index", 1),
+            "total_shares": share_data.get("total_shares", 2),
+            "prime_mod": base64.b64encode(share_data.get("prime_mod")).decode() if isinstance(share_data.get("prime_mod"), bytes) else share_data.get("prime_mod"),  # Only encode if it's bytes
             "created_at": int(time.time())
         })
         
-        # Step 2: Encrypt rumor using NIP-44
+        # Step 2: Create seal (kind 13 event with encrypted rumor)
+        # Encrypt rumor using NIP-44 from sender to receiver
         encrypted_rumor = nip44_encrypt(rumor_content, sender_privkey, receiver_pubkey)
         
-        # Step 3: Create seal (kind 13 event)
-        seal_event = {
-            "kind": 13,
-            "content": encrypted_rumor,
-            "tags": [],
-            "created_at": int(time.time()),
-            "pubkey": sender_hex
+        # Create and sign the seal event with sender's private key
+        seal_event = Event(
+            kind=13,
+            content=encrypted_rumor,
+            tags=[],
+            created_at=int(time.time()),
+            public_key=sender_key.public_key.hex()
+        )
+        sender_key.sign_event(seal_event)
+        
+        # Step 3: Create gift wrap (kind 1059 event with encrypted seal)
+        # Generate random key for gift wrap
+        random_key = PrivateKey()
+        
+        # Encrypt seal using random key to receiver (convert signed event to JSON)
+        seal_dict = {
+            "id": seal_event.id,
+            "kind": seal_event.kind,
+            "content": seal_event.content,
+            "tags": seal_event.tags,
+            "created_at": seal_event.created_at,
+            "pubkey": seal_event.public_key,
+            "sig": seal_event.signature
         }
         
-        # Step 4: Create gift wrap (kind 1059 event)
-        # Generate random key for gift wrap
-        random_key = secrets.token_hex(32)
+        gift_wrap_content = nip44_encrypt(
+            json.dumps(seal_dict), 
+            random_key.hex(), 
+            receiver_pubkey
+        )
         
-        # Encrypt seal with random key
-        gift_wrap_content = nip44_encrypt(json.dumps(seal_event), random_key, receiver_pubkey)
+        # Create and sign the gift wrap event with random private key
+        gift_wrap_event = Event(
+            kind=1059,
+            content=gift_wrap_content,
+            tags=[["p", receiver_key.hex()]],
+            created_at=int(time.time()),
+            public_key=random_key.public_key.hex()
+        )
+        random_key.sign_event(gift_wrap_event)
         
+        # Convert to dict format for return
         gift_wrap = {
-            "kind": 1059,
-            "content": gift_wrap_content,
-            "tags": [["p", receiver_hex]],
-            "created_at": int(time.time()),
-            "pubkey": hashlib.sha256(random_key.encode()).hexdigest()
+            "id": gift_wrap_event.id,
+            "kind": gift_wrap_event.kind,
+            "content": gift_wrap_event.content,
+            "tags": gift_wrap_event.tags,
+            "created_at": gift_wrap_event.created_at,
+            "pubkey": gift_wrap_event.public_key,
+            "sig": gift_wrap_event.signature
         }
         
         return gift_wrap
@@ -206,13 +189,98 @@ def create_gift_wrap(share_data, sender_privkey, receiver_pubkey):
 def unwrap_gift_wrap(gift_wrap_event, receiver_privkey):
     """Unwrap NIP-59 gift wrap to get share data"""
     try:
-        # This is a placeholder for unwrapping
-        # In real implementation, would reverse the gift wrap process
-        print("TODO: Implement gift wrap unwrapping")
-        return {"share": "decrypted_share", "threshold": 2}
+        # Convert receiver private key to proper format
+        if is_hex_key(receiver_privkey):
+            receiver_key = PrivateKey(bytes.fromhex(receiver_privkey))
+        else:
+            receiver_key = PrivateKey.from_nsec(receiver_privkey)
+        
+        # Step 1: Extract gift wrap information and verify signature
+        encrypted_content = gift_wrap_event.get('content', '')
+        random_pubkey = gift_wrap_event.get('pubkey', '')  # Random key's public key
+        
+        # Verify gift wrap event signature
+        try:
+            gift_wrap_obj = Event(
+                kind=gift_wrap_event['kind'],
+                content=gift_wrap_event['content'],
+                tags=gift_wrap_event['tags'],
+                created_at=gift_wrap_event['created_at'],
+                public_key=gift_wrap_event['pubkey']
+            )
+            gift_wrap_obj.signature = gift_wrap_event['sig']
+            gift_wrap_obj.id = gift_wrap_event['id']
+            
+            if not gift_wrap_obj.verify():
+                print(f"    Debug: Gift wrap event signature verification failed")
+                return None
+            
+        except Exception as e:
+            print(f"    Debug: Failed to verify gift wrap signature: {e}")
+            return None
+        
+        # Step 2: Decrypt the gift wrap content
+        # The content was encrypted FROM random_key TO receiver_key
+        # So we decrypt FROM receiver_key TO random_key
+        try:
+            decrypted_seal_json = nip44_decrypt(encrypted_content, receiver_privkey, random_pubkey)
+        except Exception as e:
+            print(f"    Debug: Failed to decrypt gift wrap content: {e}")
+            return None
+        
+        # Step 3: Parse the seal event
+        try:
+            seal_data = json.loads(decrypted_seal_json)
+            
+            # Verify seal event signature
+            seal_event = Event(
+                kind=seal_data['kind'],
+                content=seal_data['content'],
+                tags=seal_data['tags'],
+                created_at=seal_data['created_at'],
+                public_key=seal_data['pubkey']
+            )
+            seal_event.signature = seal_data['sig']
+            seal_event.id = seal_data['id']
+            
+            if not seal_event.verify():
+                print(f"    Debug: Seal event signature verification failed")
+                return None
+            
+        except Exception as e:
+            print(f"    Debug: Failed to parse seal event JSON: {e}")
+            return None
+        
+        # Step 4: Decrypt the seal content to get the rumor
+        seal_content = seal_event.content
+        seal_sender = seal_event.public_key  # Original sender's public key
+        
+        # Decrypt the seal content (rumor) using receiver's key and sender's public key
+        try:
+            decrypted_rumor = nip44_decrypt(seal_content, receiver_privkey, seal_sender)
+        except Exception as e:
+            print(f"    Debug: Failed to decrypt seal content: {e}")
+            return None
+        
+        # Step 5: Parse the rumor to get share data
+        try:
+            share_data = json.loads(decrypted_rumor)
+        except Exception as e:
+            print(f"    Debug: Failed to parse rumor JSON: {e}")
+            return None
+        
+        return {
+            "share": share_data.get("share"),
+            "threshold": share_data.get("threshold"),
+            "share_index": share_data.get("share_index", 1),
+            "total_shares": share_data.get("total_shares", 2),
+            "prime_mod": base64.b64decode(share_data.get("prime_mod")) if isinstance(share_data.get("prime_mod"), str) and share_data.get("prime_mod") else share_data.get("prime_mod")  # Only decode if it's a string
+        }
+        
     except Exception as e:
         print(f"Error unwrapping gift wrap: {e}")
-        sys.exit(1)
+        # Return None to indicate failure
+        return None
 
 def create_shares(args):
     """Create and distribute shares of a secret key to peers"""
@@ -242,7 +310,9 @@ def create_shares(args):
         # Create shares using sslib
         shares_result = shamir.split_secret(private_key_bytes, args.threshold, len(args.peers))
         shares_list = shares_result['shares']
+        prime_mod = shares_result['prime_mod']  # Store for recovery
         print(f"Created {len(shares_list)} shares with threshold {args.threshold}")
+        print(f"Prime modulus: {prime_mod}")
         
         # Encrypt and wrap each share for each peer
         print(f"\n--- Encrypting Shares for Peers ---")
@@ -252,12 +322,13 @@ def create_shares(args):
             share_index, share_bytes = share_tuple
             print(f"Processing share {i+1} for peer: {peer_npub[:16]}...")
             
-            # Prepare share data
+            # Prepare share data (include prime_mod for recovery)
             share_data = {
                 "share": base64.b64encode(share_bytes).decode(),
                 "threshold": args.threshold,
                 "share_index": share_index,
-                "total_shares": len(args.peers)
+                "total_shares": len(args.peers),
+                "prime_mod": prime_mod  # Include prime_mod for recovery
             }
             
             # Create gift wrap for this peer
@@ -295,7 +366,7 @@ def create_shares(args):
         # Reconstruct the dict format that recover_secret expects
         test_dict = {
             'required_shares': shares_result['required_shares'],
-            'prime_mod': shares_result['prime_mod'], 
+            'prime_mod': prime_mod,  # Use the actual prime_mod
             'shares': test_shares
         }
         reconstructed = shamir.recover_secret(test_dict)
@@ -321,6 +392,7 @@ def start_recovery(args):
     """Generate temporary key and display recovery instructions"""
     # Validate the public key
     validate_key_format(args.npub, 'npub1')
+    # TODO: we should only need one pub in args
     
     print(f"Starting recovery for npub: {args.npub}")
     print("\n--- Generating Temporary Recovery Key ---")
@@ -330,8 +402,9 @@ def start_recovery(args):
     temp_public_key = hashlib.sha256(temp_private_key.encode()).hexdigest()
     
     # Convert to nsec/npub format 
-    temp_nsec = PrivateKey(bytes.fromhex(temp_private_key)).bech32()
-    temp_npub = PublicKey(bytes.fromhex(temp_public_key)).bech32()
+    temp_key = PrivateKey(bytes.fromhex(temp_private_key))
+    temp_nsec = temp_key.bech32()
+    temp_npub = temp_key.public_key.bech32()
     
     print(f"✓ Generated temporary recovery keypair")
     print(f"Temporary recovery private key: {temp_nsec}")
@@ -402,41 +475,34 @@ def send_share(args):
         
         print(f"✓ Found {len(events)} share events")
         
-        # Use the first event (in real implementation, might need to filter by target)
-        gift_wrap_event = events[0] if events else {
-            "kind": 1059,
-            "content": "encrypted_content_placeholder", 
-            "tags": [["p", peer_hex]],
-            "created_at": int(time.time()),
-            "pubkey": "placeholder_sender"
-        }
+        # Process each event to find the right share
+        decrypted_share = None
+        for i, event in enumerate(events):
+            print(f"🔓 Attempting to decrypt gift wrap event {i+1}/{len(events)}...")
+            
+            # Try to unwrap this gift wrap
+            share_data = unwrap_gift_wrap(event, args.nsec)
+            
+            if share_data:
+                print(f"  ✓ Successfully decrypted share from event {i+1}")
+                print(f"  Share index: {share_data['share_index']}")
+                print(f"  Threshold: {share_data['threshold']}")
+                print(f"  Total shares: {share_data['total_shares']}")
+                decrypted_share = share_data
+                break
+            else:
+                print(f"  ❌ Failed to decrypt event {i+1}")
         
-        print(f"\n--- Decrypting Share ---")
-        print(f"🔓 Unwrapping gift wrap event...")
-
-        # In a real implementation, this would:
-        # 1. Decrypt the gift wrap content using the peer's private key
-        # 2. Extract the seal event
-        # 3. Decrypt the seal to get the original share
-        
-        # For demo purposes, simulate the decrypted share data
-        mock_share_data = {
-            "share": base64.b64encode(b"mock_share_bytes_from_shamir").decode(),
-            "threshold": 2,
-            "share_index": 1,
-            "total_shares": 3
-        }
-        
-        print(f"✓ Successfully decrypted share from gift wrap")
-        print(f"  Share index: {mock_share_data['share_index']}")
-        print(f"  Threshold: {mock_share_data['threshold']}")
-        print(f"  Total shares: {mock_share_data['total_shares']}")
+        if not decrypted_share:
+            print(f"❌ Could not decrypt any share events")
+            print(f"   Make sure this peer has shares for the target npub: {args.target_npub[:16]}...")
+            sys.exit(1)
         
         print(f"\n--- Re-encrypting for Recovery Key ---")
         print(f"🔐 Encrypting share for temporary recovery key...")
         
         # Create gift wrap for the recovery key
-        recovery_gift_wrap = create_gift_wrap(mock_share_data, args.nsec, args.recovery_npub)
+        recovery_gift_wrap = create_gift_wrap(decrypted_share, args.nsec, args.recovery_npub)
         
         print(f"✓ Created new gift wrap for recovery key")
         print(f"  Event kind: {recovery_gift_wrap['kind']}")
@@ -461,6 +527,10 @@ def send_share(args):
         
         print(f"\n--- Success ---")
         print(f"✅ Share successfully forwarded to recovery key!")
+        print(f"Share details:")
+        print(f"  - Share index: {decrypted_share['share_index']}")
+        print(f"  - Threshold: {decrypted_share['threshold']}")
+        print(f"  - Total shares: {decrypted_share['total_shares']}")
         print(f"The person recovering can now use this share with:")
         print(f"./skb.py recover-key --nsec <recovery_nsec> {args.relay}")
         
@@ -518,35 +588,39 @@ def recover_key(args):
         collected_shares = []
         share_metadata = None
         
-        # Mock processing of events (in real implementation, would decrypt each event)
-        # For now, simulate shares being extracted from events
-        for i, event in enumerate(events):
-            mock_share_data = {
-                "share": base64.b64encode(f"mock_share_{i+1}_bytes_from_event".encode()).decode(),
-                "threshold": 2,
-                "share_index": i + 1,
-                "total_shares": max(3, len(events))
-            }
-            
-            # Convert share back to bytes
-            share_bytes = base64.b64decode(mock_share_data['share'])
-            share_tuple = (mock_share_data['share_index'], share_bytes)
-            collected_shares.append(share_tuple)
-            
-            if share_metadata is None:
-                share_metadata = {
-                    'threshold': mock_share_data['threshold'],
-                    'total_shares': mock_share_data['total_shares']
-                }
-        
         print(f"\n--- Decrypting Shares ---")
         for i, event in enumerate(events):
-            print(f"🔓 Decrypting share from event {i+1}...")
+            print(f"🔓 Decrypting share from event {i+1}/{len(events)}...")
             
-            # In real implementation: unwrap gift wrap and decrypt with temp private key
-            # For now, we already processed the events above
+            # Use the unwrap_gift_wrap function to decrypt each recovery share
+            share_data = unwrap_gift_wrap(event, args.nsec)
             
-            print(f"  ✓ Share {i+1} decrypted")
+            if share_data:
+                print(f"  ✓ Share {i+1} decrypted successfully")
+                print(f"    Share index: {share_data['share_index']}")
+                print(f"    Threshold: {share_data['threshold']}")
+                print(f"    Total shares: {share_data['total_shares']}")
+                
+                # Convert share back to bytes for sslib
+                share_bytes = base64.b64decode(share_data['share'])
+                share_tuple = (share_data['share_index'], share_bytes)
+                collected_shares.append(share_tuple)
+                
+                # Store metadata from first valid share
+                if share_metadata is None:
+                    share_metadata = {
+                        'threshold': share_data['threshold'],
+                        'total_shares': share_data['total_shares'],
+                        'prime_mod': share_data['prime_mod']  # Store the actual prime_mod
+                    }
+            else:
+                print(f"  ❌ Failed to decrypt share from event {i+1}")
+        
+        if not collected_shares:
+            print(f"❌ Could not decrypt any recovery shares")
+            print(f"   Make sure peers have sent their shares using:")
+            print(f"   ./skb.py send-share {args.relay} --nsec <peer_nsec> <original_npub> {temp_npub}")
+            sys.exit(1)
         
         print(f"\n--- Checking Share Requirements ---")
         print(f"Required threshold: {share_metadata['threshold']}")
@@ -568,16 +642,31 @@ def recover_key(args):
         shares_for_recovery = collected_shares[:share_metadata['threshold']]
         print(f"Using {len(shares_for_recovery)} shares for reconstruction...")
         
-        # For demonstration, simulate the sslib reconstruction
-        # In real implementation, we'd need the original prime_mod from the split
+        # Reconstruct the secret using sslib
         print(f"🔧 Reconstructing secret using Shamir's Secret Sharing...")
         
-        # Create mock recovery dict (in real implementation, we'd need proper metadata)
-        # For now, just simulate a successful reconstruction
-        reconstructed_key_hex = "7777777777777777777777777777777777777777777777777777777777777777"
-        reconstructed_nsec = PrivateKey(bytes.fromhex(reconstructed_key_hex)).bech32()
-        
-        print(f"✅ Key reconstruction successful!")
+        # Use the actual prime_mod from the shares
+        try:
+            # Create the dict format that sslib expects
+            recovery_dict = {
+                'required_shares': share_metadata['threshold'],
+                'prime_mod': share_metadata['prime_mod'],  # Use actual prime_mod from shares
+                'shares': shares_for_recovery
+            }
+            
+            reconstructed_bytes = shamir.recover_secret(recovery_dict)
+            reconstructed_key_hex = reconstructed_bytes.hex()
+            reconstructed_nsec = PrivateKey(reconstructed_bytes).bech32()
+            
+            print(f"✅ Key reconstruction successful!")
+            
+        except Exception as e:
+            print(f"❌ Key reconstruction failed: {e}")
+            print(f"This could be due to:")
+            print(f"  - Corrupted shares")
+            print(f"  - Wrong threshold")
+            print(f"  - Mismatched prime_mod values")
+            sys.exit(1)
         
         print(f"\n--- Recovered Key ---")
         print(f"🔑 Your recovered private key:")
@@ -712,26 +801,40 @@ def create_relay_manager(relay_url):
 def publish_event_to_relay(relay_manager, event_dict, private_key):
     """Publish an event to relays using the relay manager"""
     try:
-        # Get the private key object
-        if isinstance(private_key, str):
-            if private_key.startswith('nsec1'):
-                priv_key = PrivateKey.from_nsec(private_key)
-            else:
-                priv_key = PrivateKey(bytes.fromhex(private_key))
+        # Check if event is already signed (has signature and id)
+        if 'sig' in event_dict and 'id' in event_dict:
+            # Event is already signed, use it as-is
+            event = Event(
+                kind=event_dict['kind'],
+                content=event_dict['content'],
+                tags=event_dict['tags'],
+                created_at=event_dict['created_at'],
+                public_key=event_dict['pubkey']
+            )
+            event.signature = event_dict['sig']
+            event.id = event_dict['id']
         else:
-            priv_key = private_key
-        
-        # Create proper Event object with the correct public key for signing
-        event = Event(
-            kind=event_dict['kind'],
-            content=event_dict['content'],
-            tags=event_dict['tags'],
-            created_at=event_dict['created_at'],
-            public_key=priv_key.public_key.hex()
-        )
-        
-        # Sign the event using the private key
-        priv_key.sign_event(event)
+            # Event needs to be signed
+            # Get the private key object
+            if isinstance(private_key, str):
+                if private_key.startswith('nsec1'):
+                    priv_key = PrivateKey.from_nsec(private_key)
+                else:
+                    priv_key = PrivateKey(bytes.fromhex(private_key))
+            else:
+                priv_key = private_key
+            
+            # Create proper Event object with the correct public key for signing
+            event = Event(
+                kind=event_dict['kind'],
+                content=event_dict['content'],
+                tags=event_dict['tags'],
+                created_at=event_dict['created_at'],
+                public_key=priv_key.public_key.hex()
+            )
+            
+            # Sign the event using the private key
+            priv_key.sign_event(event)
         
         # Publish with retry
         max_retries = 3

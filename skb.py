@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 import time
 import hashlib
+from nostr.key import PrivateKey, PublicKey
 
 def is_hex_key(key):
     """Check if key is a valid 64-character hex string"""
@@ -24,70 +25,52 @@ def is_hex_key(key):
 
 def is_bech32_key(key):
     """Check if key starts with npub1 or nsec1"""
-    return key.startswith(('npub1', 'nsec1')) and len(key) == 63
+    return key.startswith(('npub1', 'nsec1'))
 
 def validate_key_format(key, expected_prefix=None):
-    """Validate key format and optionally check prefix"""
-    if not (is_hex_key(key) or is_bech32_key(key)):
-        print(f"Error: Invalid key format: {key}")
-        print("Keys must be either 64-character hex or bech32 format (npub1/nsec1)")
-        sys.exit(1)
+    """Validate key format and optionally check prefix using nostr library"""
+    try:
+        # Try to parse the key to validate format
+        if is_hex_key(key):
+            # Valid hex key (can't determine type without context)
+            pass
+        elif key.startswith('nsec1'):
+            PrivateKey.from_nsec(key)
+        elif key.startswith('npub1'):
+            PublicKey.from_npub(key)
+        else:
+            raise ValueError("Invalid format")
     
-    if expected_prefix and is_bech32_key(key) and not key.startswith(expected_prefix):
-        print(f"Error: Expected {expected_prefix} key, got: {key}")
-        sys.exit(1)
-
-def convert_key_to_hex(key):
-    """Convert key to hex format"""
-    if is_hex_key(key):
-        return key.lower()
-    elif is_bech32_key(key):
-        # TODO: Simple bech32 decode for now - in real implementation use proper bech32 library
-        try:
-            # This is a placeholder - real implementation would use proper bech32 decoding
-            if key.startswith(('npub1', 'nsec1')):
-                # For now, just validate format and return a hex representation
-                # In production, use proper bech32 decoding
-                print("Note: bech32 conversion is placeholder - use hex keys for now")
-                # Generate a deterministic hex from the bech32 for demo purposes
-                return hashlib.sha256(key.encode()).hexdigest()
-        except Exception as e:
-            print(f"Error converting bech32 key: {e}")
+        if expected_prefix and is_bech32_key(key) and not key.startswith(expected_prefix):
+            print(f"Error: Expected {expected_prefix} key, got: {key}")
             sys.exit(1)
-    else:
+            
+    except Exception as e:
         print(f"Error: Invalid key format: {key}")
+        print("Keys must be either 64-character hex or valid bech32 format (npub1/nsec1)")
         sys.exit(1)
-
-def convert_hex_to_npub(hex_key):
-    """Convert hex public key to npub format (placeholder)"""
-    if not is_hex_key(hex_key):
-        print(f"Error: Invalid hex key format: {hex_key}")
-        sys.exit(1)
-    # Placeholder implementation
-    return f"npub1{hex_key[:50]}{'0' * 13}"
-
-def convert_hex_to_nsec(hex_key):
-    """Convert hex private key to nsec format (placeholder)"""
-    if not is_hex_key(hex_key):
-        print(f"Error: Invalid hex key format: {hex_key}")
-        sys.exit(1)
-    # Placeholder implementation  
-    return f"nsec1{hex_key[:50]}{'0' * 13}"
 
 # Crypto Functions (Basic NIP-44 & NIP-59 implementation)
 def nip44_encrypt(plaintext, sender_privkey, receiver_pubkey):
-    """Basic NIP-44-style encryption using AES-GCM"""
+    """NIP-44-style encryption using proper ECDH with nostr library"""
     try:
-        # Convert keys to bytes
-        sender_hex = convert_key_to_hex(sender_privkey)
-        receiver_hex = convert_key_to_hex(receiver_pubkey)
+        # Convert keys to proper nostr objects
+        if is_hex_key(sender_privkey):
+            sender_key = PrivateKey(bytes.fromhex(sender_privkey))
+        else:
+            sender_key = PrivateKey.from_nsec(sender_privkey)
+            
+        if is_hex_key(receiver_pubkey):
+            receiver_key = PublicKey(bytes.fromhex(receiver_pubkey))
+        else:
+            receiver_key = PublicKey.from_npub(receiver_pubkey)
         
         # Ensure plaintext is string
         if isinstance(plaintext, bytes):
             plaintext = plaintext.decode()
         
-        # Create shared secret (simplified ECDH)
-        shared_secret = hashlib.sha256((sender_hex + receiver_hex).encode()).digest()
+        # Create proper ECDH shared secret using nostr library  
+        shared_secret = sender_key.compute_shared_secret(receiver_key.hex())
         
         # Derive encryption key using HKDF
         derived_key = HKDF(
@@ -115,7 +98,7 @@ def nip44_encrypt(plaintext, sender_privkey, receiver_pubkey):
         sys.exit(1)
 
 def nip44_decrypt(ciphertext, receiver_privkey, sender_pubkey):
-    """Basic NIP-44-style decryption using AES-GCM"""
+    """NIP-44-style decryption using proper ECDH with nostr library"""
     try:
         # Decode from base64
         encrypted_data = base64.b64decode(ciphertext)
@@ -125,10 +108,19 @@ def nip44_decrypt(ciphertext, receiver_privkey, sender_pubkey):
         tag = encrypted_data[12:28]
         ciphertext_bytes = encrypted_data[28:]
         
-        # Convert keys to bytes and create shared secret
-        receiver_hex = convert_key_to_hex(receiver_privkey)
-        sender_hex = convert_key_to_hex(sender_pubkey)
-        shared_secret = hashlib.sha256((sender_hex + receiver_hex).encode()).digest()
+        # Convert keys to proper nostr objects
+        if is_hex_key(receiver_privkey):
+            receiver_key = PrivateKey(bytes.fromhex(receiver_privkey))
+        else:
+            receiver_key = PrivateKey.from_nsec(receiver_privkey)
+            
+        if is_hex_key(sender_pubkey):
+            sender_key = PublicKey(bytes.fromhex(sender_pubkey))
+        else:
+            sender_key = PublicKey.from_npub(sender_pubkey)
+        
+        # Create proper ECDH shared secret using nostr library
+        shared_secret = receiver_key.compute_shared_secret(sender_key.hex())
         
         # Derive decryption key
         derived_key = HKDF(
@@ -154,8 +146,15 @@ def create_gift_wrap(share_data, sender_privkey, receiver_pubkey):
     """Create NIP-59 gift wrap containing encrypted share"""
     try:
         # Convert keys to proper format
-        sender_hex = convert_key_to_hex(sender_privkey)
-        receiver_hex = convert_key_to_hex(receiver_pubkey)
+        if is_hex_key(sender_privkey):
+            sender_hex = sender_privkey.lower()
+        else:
+            sender_hex = PrivateKey.from_nsec(sender_privkey).hex()
+            
+        if is_hex_key(receiver_pubkey):
+            receiver_hex = receiver_pubkey.lower()
+        else:
+            receiver_hex = PublicKey.from_npub(receiver_pubkey).hex()
         
         # Step 1: Create rumor (unsigned event with share data)
         rumor_content = json.dumps({
@@ -224,7 +223,10 @@ def create_shares(args):
     
     try:
         # Convert nsec to hex for secret sharing
-        private_key_hex = convert_key_to_hex(args.nsec)
+        if is_hex_key(args.nsec):
+            private_key_hex = args.nsec.lower()
+        else:
+            private_key_hex = PrivateKey.from_nsec(args.nsec).hex()
         private_key_bytes = bytes.fromhex(private_key_hex)
         
         print(f"\n--- Creating Shamir's Secret Shares ---")
@@ -306,9 +308,9 @@ def start_recovery(args):
     temp_private_key = secrets.token_hex(32)
     temp_public_key = hashlib.sha256(temp_private_key.encode()).hexdigest()
     
-    # Convert to nsec/npub format (placeholder implementation)
-    temp_nsec = convert_hex_to_nsec(temp_private_key)
-    temp_npub = convert_hex_to_npub(temp_public_key)
+    # Convert to nsec/npub format 
+    temp_nsec = PrivateKey(bytes.fromhex(temp_private_key)).bech32()
+    temp_npub = PublicKey(bytes.fromhex(temp_public_key)).bech32()
     
     print(f"✓ Generated temporary recovery keypair")
     print(f"Temporary recovery private key: {temp_nsec}")
@@ -347,8 +349,11 @@ def send_share(args):
         print(f"Searching for gift wrap events sent to: {args.nsec[:16]}...")
         
         # Convert peer's nsec to npub to search for shares sent to them
-        peer_hex = convert_key_to_hex(args.nsec)
-        peer_npub = convert_hex_to_npub(peer_hex)
+        if is_hex_key(args.nsec):
+            peer_hex = args.nsec.lower()
+        else:
+            peer_hex = PrivateKey.from_nsec(args.nsec).hex()
+        peer_npub = PublicKey(bytes.fromhex(peer_hex)).bech32()
         
         print(f"Peer npub: {peer_npub[:16]}...")
         print(f"📡 Querying relay: {args.relay}")
@@ -424,8 +429,11 @@ def recover_key(args):
     
     try:
         # Convert temp nsec to npub for querying
-        temp_hex = convert_key_to_hex(args.nsec)
-        temp_npub = convert_hex_to_npub(temp_hex)
+        if is_hex_key(args.nsec):
+            temp_hex = args.nsec.lower()
+        else:
+            temp_hex = PrivateKey.from_nsec(args.nsec).hex()
+        temp_npub = PublicKey(bytes.fromhex(temp_hex)).bech32()
         
         print(f"\n--- Querying Relay for Recovery Shares ---")
         print(f"Temporary npub: {temp_npub[:16]}...")
@@ -518,7 +526,7 @@ def recover_key(args):
         # Create mock recovery dict (in real implementation, we'd need proper metadata)
         # For now, just simulate a successful reconstruction
         reconstructed_key_hex = "7777777777777777777777777777777777777777777777777777777777777777"
-        reconstructed_nsec = convert_hex_to_nsec(reconstructed_key_hex)
+        reconstructed_nsec = PrivateKey(bytes.fromhex(reconstructed_key_hex)).bech32()
         
         print(f"✅ Key reconstruction successful!")
         
@@ -548,7 +556,10 @@ def destroy_shares(args):
     
     try:
         # Convert nsec to public key for querying
-        private_key_hex = convert_key_to_hex(args.nsec)
+        if is_hex_key(args.nsec):
+            private_key_hex = args.nsec.lower()
+        else:
+            private_key_hex = PrivateKey.from_nsec(args.nsec).hex()
         public_key_hex = hashlib.sha256(private_key_hex.encode()).hexdigest()
         
         print(f"\n--- Searching for Share Events ---")

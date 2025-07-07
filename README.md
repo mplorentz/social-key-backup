@@ -53,3 +53,11 @@ skb destroy-shares --nsec nsec123 wss://nos.lol
 ```
 
 Where `nsec123` is your nsec.
+
+## Building
+
+```shell
+virtualenv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```

@@ -121,6 +121,7 @@ def create_gift_wrap(share_data, sender_privkey, receiver_pubkey):
             "share_index": share_data.get("share_index", 1),
             "total_shares": share_data.get("total_shares", 2),
             "prime_mod": base64.b64encode(share_data.get("prime_mod")).decode() if isinstance(share_data.get("prime_mod"), bytes) else share_data.get("prime_mod"),  # Only encode if it's bytes
+            "creator_pubkey": share_data.get("creator_pubkey"),  # Include creator pubkey for verification
             "created_at": int(time.time())
         })
         
@@ -274,7 +275,8 @@ def unwrap_gift_wrap(gift_wrap_event, receiver_privkey):
             "threshold": share_data.get("threshold"),
             "share_index": share_data.get("share_index", 1),
             "total_shares": share_data.get("total_shares", 2),
-            "prime_mod": base64.b64decode(share_data.get("prime_mod")) if isinstance(share_data.get("prime_mod"), str) and share_data.get("prime_mod") else share_data.get("prime_mod")  # Only decode if it's a string
+            "prime_mod": base64.b64decode(share_data.get("prime_mod")) if isinstance(share_data.get("prime_mod"), str) and share_data.get("prime_mod") else share_data.get("prime_mod"),  
+            "creator_pubkey": share_data.get("creator_pubkey") 
         }
         
     except Exception as e:
@@ -318,6 +320,13 @@ def create_shares(args):
         print(f"\n--- Encrypting Shares for Peers ---")
         gift_wraps = []
         
+        # Get creator's public key
+        if is_hex_key(args.nsec):
+            creator_private_key = PrivateKey(bytes.fromhex(args.nsec))
+        else:
+            creator_private_key = PrivateKey.from_nsec(args.nsec)
+        creator_pubkey = creator_private_key.public_key.hex()
+        
         for i, (peer_npub, share_tuple) in enumerate(zip(args.peers, shares_list)):
             share_index, share_bytes = share_tuple
             print(f"Processing share {i+1} for peer: {peer_npub[:16]}...")
@@ -328,7 +337,8 @@ def create_shares(args):
                 "threshold": args.threshold,
                 "share_index": share_index,
                 "total_shares": len(args.peers),
-                "prime_mod": prime_mod  # Include prime_mod for recovery
+                "prime_mod": prime_mod,  
+                "creator_pubkey": creator_pubkey  
             }
             
             # Create gift wrap for this peer
@@ -448,6 +458,12 @@ def send_share(args):
         
         peer_npub = PublicKey(bytes.fromhex(peer_pubkey_hex)).bech32()
         
+        # Convert target_npub to hex for verification
+        if is_hex_key(args.target_npub):
+            target_pubkey_hex = args.target_npub.lower()
+        else:
+            target_pubkey_hex = PublicKey.from_npub(args.target_npub).hex()
+        
         print(f"📡 Connecting to relay: {args.relay}")
         relay_manager = create_relay_manager(args.relay)
         
@@ -482,16 +498,23 @@ def send_share(args):
             
             if share_data:
                 print(f"  ✓ Successfully decrypted share from event {i+1}")
-                print(f"  Share index: {share_data['share_index']}")
-                print(f"  Threshold: {share_data['threshold']}")
-                print(f"  Total shares: {share_data['total_shares']}")
+                
+                # Verify that this share is for the target npub being recovered
+                share_creator_pubkey = share_data.get('creator_pubkey', '')
+                if share_creator_pubkey.lower() != target_pubkey_hex.lower():
+                    print(f"  ❌ Share verification failed: share is not for target npub")
+                    print(f"    Share creator: {share_creator_pubkey[:16]}...")
+                    print(f"    Target npub:   {target_pubkey_hex[:16]}...")
+                    continue
+                print(f"  ✓ Share verified for target npub: {target_pubkey_hex[:16]}...")
+                
                 decrypted_share = share_data
                 break
             else:
                 print(f"  ❌ Failed to decrypt event {i+1}")
         
         if not decrypted_share:
-            print(f"❌ Could not decrypt any share events")
+            print(f"❌ Could not decrypt any share events or verify them for target npub")
             print(f"   Make sure this peer has shares for the target npub: {args.target_npub[:16]}...")
             sys.exit(1)
         

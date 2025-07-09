@@ -55,51 +55,6 @@ def validate_key_format(key, expected_prefix=None):
         print("Keys must be either 64-character hex or valid bech32 format (npub1/nsec1)")
         sys.exit(1)
 
-# Crypto Functions (Basic NIP-44 & NIP-59 implementation)
-def nip44_encrypt(plaintext, sender_privkey, receiver_pubkey):
-    """NIP-44-style encryption using nostr library's built-in methods"""
-    try:
-        # Convert keys to proper nostr objects
-        if is_hex_key(sender_privkey):
-            sender_key = PrivateKey(bytes.fromhex(sender_privkey))
-        else:
-            sender_key = PrivateKey.from_nsec(sender_privkey)
-            
-        if is_hex_key(receiver_pubkey):
-            receiver_key = PublicKey(bytes.fromhex(receiver_pubkey))
-        else:
-            receiver_key = PublicKey.from_npub(receiver_pubkey)
-        
-        # Ensure plaintext is string
-        if isinstance(plaintext, bytes):
-            plaintext = plaintext.decode('utf-8')
-        
-        # Use nostr library's built-in encryption
-        return sender_key.encrypt_message(plaintext, receiver_key.hex())
-        
-    except Exception as e:
-        raise ValueError(f"Error in NIP-44 encryption: {e}")
-
-def nip44_decrypt(ciphertext, receiver_privkey, sender_pubkey):
-    """NIP-44-style decryption using nostr library's built-in methods"""
-    try:
-        # Convert keys to proper nostr objects
-        if is_hex_key(receiver_privkey):
-            receiver_key = PrivateKey(bytes.fromhex(receiver_privkey))
-        else:
-            receiver_key = PrivateKey.from_nsec(receiver_privkey)
-            
-        if is_hex_key(sender_pubkey):
-            sender_key = PublicKey(bytes.fromhex(sender_pubkey))
-        else:
-            sender_key = PublicKey.from_npub(sender_pubkey)
-        
-        # Use nostr library's built-in decryption
-        return receiver_key.decrypt_message(ciphertext, sender_key.hex())
-        
-    except Exception as e:
-        raise ValueError(f"Error in NIP-44 decryption: {e}")
-
 def create_gift_wrap(share_data, sender_privkey, receiver_pubkey):
     """Create NIP-59 gift wrap containing encrypted share"""
     try:
@@ -115,6 +70,8 @@ def create_gift_wrap(share_data, sender_privkey, receiver_pubkey):
             receiver_key = PublicKey.from_npub(receiver_pubkey)
         
         # Step 1: Create rumor (unsigned event with share data)
+        # I know rumor is supposed to be a nostr event, but why? I'm not
+        # going to bother with that for this prototype.
         rumor_content = json.dumps({
             "share": share_data["share"],
             "threshold": share_data["threshold"],
@@ -127,7 +84,7 @@ def create_gift_wrap(share_data, sender_privkey, receiver_pubkey):
         
         # Step 2: Create seal (kind 13 event with encrypted rumor)
         # Encrypt rumor using NIP-44 from sender to receiver
-        encrypted_rumor = nip44_encrypt(rumor_content, sender_privkey, receiver_pubkey)
+        encrypted_rumor = sender_key.encrypt_message(rumor_content, receiver_key.hex())
         
         # Create and sign the seal event with sender's private key
         seal_event = Event(
@@ -154,11 +111,7 @@ def create_gift_wrap(share_data, sender_privkey, receiver_pubkey):
             "sig": seal_event.signature
         }
         
-        gift_wrap_content = nip44_encrypt(
-            json.dumps(seal_dict), 
-            random_key.hex(), 
-            receiver_pubkey
-        )
+        gift_wrap_content = random_key.encrypt_message(json.dumps(seal_dict), receiver_key.hex())
         
         # Create and sign the gift wrap event with random private key
         gift_wrap_event = Event(
@@ -224,7 +177,7 @@ def unwrap_gift_wrap(gift_wrap_event, receiver_privkey):
         # The content was encrypted FROM random_key TO receiver_key
         # So we decrypt FROM receiver_key TO random_key
         try:
-            decrypted_seal_json = nip44_decrypt(encrypted_content, receiver_privkey, random_pubkey)
+            decrypted_seal_json = receiver_key.decrypt_message(encrypted_content, random_pubkey)
         except Exception as e:
             print(f"    Debug: Failed to decrypt gift wrap content: {e}")
             return None
@@ -258,7 +211,7 @@ def unwrap_gift_wrap(gift_wrap_event, receiver_privkey):
         
         # Decrypt the seal content (rumor) using receiver's key and sender's public key
         try:
-            decrypted_rumor = nip44_decrypt(seal_content, receiver_privkey, seal_sender)
+            decrypted_rumor = receiver_key.decrypt_message(seal_content, seal_sender)
         except Exception as e:
             print(f"    Debug: Failed to decrypt seal content: {e}")
             return None

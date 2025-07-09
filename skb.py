@@ -71,7 +71,7 @@ def create_gift_wrap(share_data, sender_privkey, receiver_pubkey):
         
         # Step 1: Create rumor (unsigned event with share data)
         # I know rumor is supposed to be a nostr event, but why? I'm not
-        # going to bother with that for this prototype.
+        # going to bother with that for this prototype, we'll just use raw JSON.
         rumor_content = json.dumps({
             "share": share_data["share"],
             "threshold": share_data["threshold"],
@@ -239,16 +239,16 @@ def unwrap_gift_wrap(gift_wrap_event, receiver_privkey):
 
 def create_shares(args):
     """Create and distribute shares of a secret key to peers"""
-    # Validate the private key
     validate_key_format(args.nsec, 'nsec1')
-    
-    # Validate peer public keys
     for peer in args.peers:
         validate_key_format(peer, 'npub1')
     
     # Validate threshold
-    if args.threshold < 1 or args.threshold > len(args.peers):
-        print(f"Error: Threshold {args.threshold} must be between 1 and {len(args.peers)} (number of peers)")
+    if args.threshold < 2:
+        print(f"Error: Threshold {args.threshold} must be higher than 1")
+        sys.exit(1)
+    if args.threshold > len(args.peers):
+        print(f"Error: Threshold {args.threshold} must be between 2 and {len(args.peers)} (number of peers)")
         sys.exit(1)
     
     try:
@@ -260,12 +260,11 @@ def create_shares(args):
         private_key_bytes = bytes.fromhex(private_key_hex)
         
         print(f"\n--- Creating Shamir's Secret Shares ---")
-        print(f"Secret length: {len(private_key_bytes)} bytes")
         
         # Create shares using sslib
         shares_result = shamir.split_secret(private_key_bytes, args.threshold, len(args.peers))
         shares_list = shares_result['shares']
-        prime_mod = shares_result['prime_mod']  # Store for recovery
+        prime_mod = shares_result['prime_mod']  
         print(f"Created {len(shares_list)} shares with threshold {args.threshold}")
         print(f"Prime modulus: {prime_mod}")
         
@@ -322,8 +321,7 @@ def create_shares(args):
         relay_manager.close_connections()
         print(f"✓ Published {published_count}/{len(gift_wraps)} events to relay")
         
-        # TODO: Test share reconstruction - remove later
-        print(f"\n--- Testing Share Reconstruction ---")
+        # Sanity check that we can reconstruct the secret from the shares
         test_shares = shares_list[:args.threshold]  # Take only threshold number of shares
         
         # Reconstruct the dict format that recover_secret expects
@@ -334,18 +332,15 @@ def create_shares(args):
         }
         reconstructed = shamir.recover_secret(test_dict)
         
-        if reconstructed == private_key_bytes:
-            print(f"✓ Share reconstruction test PASSED")
-            print(f"✓ Original and reconstructed keys match")
-        else:
-            print(f"✗ Share reconstruction test FAILED")
+        if reconstructed != private_key_bytes:
+            print(f"✗ Share reconstruction test FAILED. This is a bug.")
+            sys.exit(1)
             return
         
         print(f"\n--- Success ---")
         print(f"✓ Created {len(shares_list)} shares with threshold {args.threshold}")
         print(f"✓ Encrypted shares for {len(args.peers)} peers")
         print(f"✓ Published {published_count}/{len(gift_wraps)} events to relay")
-        print(f"✓ Share reconstruction verified")
         
     except Exception as e:
         print(f"Error creating shares: {e}")
@@ -355,17 +350,12 @@ def start_recovery(args):
     """Generate temporary key and display recovery instructions"""
     # Validate the public key
     validate_key_format(args.npub, 'npub1')
-    # TODO: we should only need one pub in args
     
     print(f"Starting recovery for npub: {args.npub}")
     print("\n--- Generating Temporary Recovery Key ---")
     
     # Generate temporary keypair
-    temp_private_key = secrets.token_hex(32)
-    temp_public_key = hashlib.sha256(temp_private_key.encode()).hexdigest()
-    
-    # Convert to nsec/npub format 
-    temp_key = PrivateKey(bytes.fromhex(temp_private_key))
+    temp_key = PrivateKey()
     temp_nsec = temp_key.bech32()
     temp_npub = temp_key.public_key.bech32()
     
@@ -391,7 +381,6 @@ def start_recovery(args):
 
 def send_share(args):
     """Send a share from peer to recovery key"""
-    # Validate keys
     validate_key_format(args.nsec, 'nsec1')
     validate_key_format(args.target_npub, 'npub1')
     validate_key_format(args.recovery_npub, 'npub1')
@@ -478,9 +467,7 @@ def send_share(args):
         recovery_gift_wrap = create_gift_wrap(decrypted_share, args.nsec, args.recovery_npub)
         
         print(f"✓ Created new gift wrap for recovery key")
-        print(f"  Event kind: {recovery_gift_wrap['kind']}")
-        print(f"  Content length: {len(recovery_gift_wrap['content'])}")
-        print(f"  Target: {args.recovery_npub[:16]}...")
+        print(f"  Sending to: {args.recovery_npub[:16]}...")
         
         print(f"\n--- Publishing to Relay ---")
         print(f"📤 Publishing recovery gift wrap to: {args.relay}")
@@ -500,10 +487,6 @@ def send_share(args):
         
         print(f"\n--- Success ---")
         print(f"✅ Share successfully forwarded to recovery key!")
-        print(f"Share details:")
-        print(f"  - Share index: {decrypted_share['share_index']}")
-        print(f"  - Threshold: {decrypted_share['threshold']}")
-        print(f"  - Total shares: {decrypted_share['total_shares']}")
         print(f"The person recovering can now use this share with:")
         print(f"./skb.py recover-key --nsec <recovery_nsec> {args.relay}")
         
@@ -657,109 +640,6 @@ def recover_key(args):
         print(f"Error recovering key: {e}")
         sys.exit(1)
 
-def destroy_shares(args):
-    """Destroy all shares for a key"""
-    # Validate the private key
-    validate_key_format(args.nsec, 'nsec1')
-    
-    print(f"Destroying shares for nsec: {args.nsec[:16]}...")
-    print(f"On relay: {args.relay}")
-    
-    try:
-        # Convert nsec to public key for querying
-        if is_hex_key(args.nsec):
-            private_key_hex = args.nsec.lower()
-            private_key = PrivateKey(bytes.fromhex(private_key_hex))
-            public_key_hex = private_key.public_key.hex()
-        else:
-            private_key = PrivateKey.from_nsec(args.nsec)
-            public_key_hex = private_key.public_key.hex()
-        
-        print(f"\n--- Searching for Share Events ---")
-        print(f"📡 Connecting to relay: {args.relay}")
-        
-        relay_manager = create_relay_manager(args.relay)
-        
-        print(f"🔍 Looking for gift wrap events created by: {public_key_hex[:16]}...")
-        
-        # Query for share events created by this key
-        events = query_events_from_relay(
-            relay_manager,
-            kinds=[1059],
-            authors=[public_key_hex],
-            since=int(time.time()) - 86400 * 7  # Last 7 days
-        )
-        
-        relay_manager.close_connections()
-        
-        print(f"✓ Found {len(events)} share events to delete")
-        
-        if len(events) == 0:
-            print(f"ℹ️  No share events found for this key")
-            print(f"Either no shares were created, or they were already deleted")
-            return
-        
-        print(f"\n--- Creating Deletion Events ---")
-        deletion_events = []
-        
-        for i, share_event in enumerate(events):
-            print(f"📝 Creating NIP-09 deletion event for share {i+1}...")
-            
-            # Create NIP-09 deletion event (kind 5)
-            deletion_event = {
-                "kind": 5,
-                "content": f"Deleting share event {share_event.get('id', 'unknown')}",
-                "tags": [
-                    ["e", share_event.get("id", "unknown"), args.relay],  # Event to delete
-                    ["k", str(share_event.get("kind", 1059))]        # Kind of event being deleted
-                ],
-                "created_at": int(time.time()),
-                "pubkey": public_key_hex
-            }
-            
-            deletion_events.append(deletion_event)
-            print(f"  ✓ Deletion event {i+1} created")
-        
-        print(f"\n--- Publishing Deletion Events ---")
-        print(f"📤 Publishing {len(deletion_events)} deletion events to: {args.relay}")
-        
-        # Connect to relay and publish deletion events
-        relay_manager = create_relay_manager(args.relay)
-        
-        published_deletions = 0
-        for i, deletion_event in enumerate(deletion_events):
-            print(f"📤 Publishing deletion event {i+1}/{len(deletion_events)}...")
-            
-            event_id = publish_event_to_relay(relay_manager, deletion_event, args.nsec)
-            if event_id:
-                print(f"  ✓ Published deletion: {event_id[:16]}...")
-                published_deletions += 1
-            else:
-                print(f"  ❌ Failed to publish deletion {i+1}")
-        
-        relay_manager.close_connections()
-            
-        print(f"\n--- Cleanup Complete ---")
-        print(f"✅ Successfully requested deletion of {published_deletions}/{len(events)} share events")
-        print()
-        print(f"📋 What happens next:")
-        print(f"1. Relays that support NIP-09 will delete the original share events")
-        print(f"2. Some relays may ignore deletion requests - this is normal")
-        print(f"3. Peers will no longer be able to retrieve shares from compliant relays")
-        print(f"4. This does NOT delete shares that peers have already downloaded")
-        print()
-        print(f"⚠️  Security Note:")
-        print(f"If you're destroying shares due to key compromise:")
-        print(f"1. Generate a new keypair immediately")
-        print(f"2. Move any funds/data to the new key")
-        print(f"3. Inform contacts about the new key")
-        print()
-        print(f"✅ Share destruction completed!")
-        
-    except Exception as e:
-        print(f"Error destroying shares: {e}")
-        sys.exit(1)
-
 # Relay Helper Functions
 def create_relay_manager(relay_url):
     """Create and configure a relay manager"""
@@ -856,7 +736,7 @@ def query_events_from_relay(relay_manager, kinds=None, authors=None, p_tags=None
         relay_manager.publish_message(message)
         
         # Wait for events to arrive
-        time.sleep(3)
+        time.sleep(2)
         
         # Collect events from message pool
         events = []
@@ -920,12 +800,6 @@ def main():
     recover_parser.add_argument('--nsec', required=True, help='Temporary recovery private key')
     recover_parser.add_argument('relay', help='Relay URL')
     recover_parser.set_defaults(func=recover_key)
-    
-    # destroy-shares command
-    destroy_parser = subparsers.add_parser('destroy-shares', help='Destroy all shares')
-    destroy_parser.add_argument('--nsec', required=True, help='Your private key (nsec or hex)')
-    destroy_parser.add_argument('relay', help='Relay URL')
-    destroy_parser.set_defaults(func=destroy_shares)
     
     args = parser.parse_args()
     

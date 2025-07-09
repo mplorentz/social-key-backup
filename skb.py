@@ -433,13 +433,8 @@ def send_share(args):
     validate_key_format(args.target_npub, 'npub1')
     validate_key_format(args.recovery_npub, 'npub1')
     
-    print(f"Sending share from relay: {args.relay}")
-    print(f"Using peer nsec: {args.nsec[:16]}...")
-    print(f"Target npub (original key): {args.target_npub[:16]}...")
-    print(f"Recovery npub (temporary): {args.recovery_npub[:16]}...")
-    
     try:
-        print(f"\n--- Querying Relay for Shares ---")
+        print(f"--- Querying Relay for Shares ---")
         print(f"Searching for gift wrap events sent to: {args.nsec[:16]}...")
         
         # Convert peer's nsec to public key hex for searching
@@ -453,7 +448,6 @@ def send_share(args):
         
         peer_npub = PublicKey(bytes.fromhex(peer_pubkey_hex)).bech32()
         
-        print(f"Peer npub: {peer_npub[:16]}...")
         print(f"📡 Connecting to relay: {args.relay}")
         relay_manager = create_relay_manager(args.relay)
         
@@ -474,6 +468,9 @@ def send_share(args):
             sys.exit(1)
         
         print(f"✓ Found {len(events)} share events")
+
+        # Sort shares so we get the newest one first.
+        events.sort(key=lambda event: event['created_at'], reverse=True)
         
         # Process each event to find the right share
         decrypted_share = None
